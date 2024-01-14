@@ -9,6 +9,7 @@ from models.rssm import EnsembleRSSM
 from models.tssm import EnsembleTSSM
 from models.dense import DenseModel, Actor
 from models.pixel import ObsDecoder, ObsEncoder
+from models.lang import LangEncoder
 from dynamics import WORLD_MODEL
 from dynamics.rssm_world_model import get_parameters
 from utils.data import OfflineDataset
@@ -21,9 +22,9 @@ LATENT_MODEL = {'RSSM': EnsembleRSSM, 'TSSM': EnsembleTSSM}
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model-type', type=str, default='TSSM')
-    parser.add_argument('--task', type=str, default='dmc_cheetah_run')
-    parser.add_argument('--data-path', type=str, default='/home/yihaosun/code/rl/vd4rl/new_vd4rl/main/cheetah_run/expert/64px')
+    parser.add_argument('--model-type', type=str, default='RSSM')
+    parser.add_argument('--task', type=str, default='sawyer')
+    parser.add_argument('--data-path', type=str, default='/home/yihaosun/code/rl/visual-dynamics-model/generated_data')
 
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--device', type=str, default='cuda')
@@ -56,7 +57,8 @@ def init_world_model(args):
     ObsEncoder_ = ObsEncoder(args.obs_shape, args.obs_embedding_size, **args.obs_encoder).to(args.device)
     ObsDecoder_ = ObsDecoder(args.obs_shape, args.modelstate_size, **args.obs_decoder).to(args.device)
     RewardModel = DenseModel((1,), args.modelstate_size, **args.reward_model).to(args.device)
-    ActionModel = Actor((args.action_dim,), args.modelstate_size, **args.action_model).to(args.device)
+    ActionModel = Actor((args.action_dim,), args.modelstate_size+768, **args.action_model).to(args.device)
+    LangModel = LangEncoder(finetune=False, aug=False, scratch=False).to(args.device)
     world_list = [latent_model, ObsEncoder_, ObsDecoder_, RewardModel, ActionModel]
     if args.loss_scale['discount'] > 0:
         DiscountModel = DenseModel((1,), args.modelstate_size, **args.discount_model).to(args.device)
@@ -67,7 +69,7 @@ def init_world_model(args):
 
     world_model = WORLD_MODEL[args.model_type](
         latent_model, ObsEncoder_, ObsDecoder_, \
-        RewardModel, DiscountModel, ActionModel, model_optimizer, \
+        RewardModel, DiscountModel, ActionModel, LangModel, model_optimizer, \
         seq_len=args.seq_len, kl_info=args.kl_info, \
         loss_scale=args.loss_scale, grad_clip_norm=args.grad_clip_norm, \
         device=args.device
@@ -79,7 +81,7 @@ def init_world_model(args):
 def main(args=get_args()):
     # create dataset
     args.obs_shape = (3, 64, 64)
-    args.action_dim = 6
+    args.action_dim = 5
     print(f'obs shape: {args.obs_shape}, action_dim: {args.action_dim}')
     dataset = OfflineDataset(args.data_path, seq_len=args.seq_len, device=args.device)
 

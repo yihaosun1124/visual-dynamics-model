@@ -31,6 +31,7 @@ class RSSMWorldModel():
             RewardModel,
             DiscountModel,
             ActionModel,
+            LangModel,
             model_optimizer,
             seq_len,
             kl_info,
@@ -46,7 +47,8 @@ class RSSMWorldModel():
         self.ObsDecoder = ObsDecoder
         self.RewardModel = RewardModel
         self.ActionModel = ActionModel
-        self.world_list = [RSSM, self.ObsEncoder, self.ObsDecoder, self.RewardModel, self.ActionModel]
+        self.LangModel = LangModel
+        self.world_list = [self.RSSM, self.ObsEncoder, self.ObsDecoder, self.RewardModel, self.ActionModel]
         if DiscountModel is not None:
             self.DiscountModel = DiscountModel
             self.world_list.append(self.DiscountModel)
@@ -61,13 +63,8 @@ class RSSMWorldModel():
         self._grad_clip_norm = grad_clip_norm
 
     def _torch_train(self, mode=True):
-        self.RSSM.train(mode)
-        self.ObsEncoder.train(mode)
-        self.ObsDecoder.train(mode)
-        self.RewardModel.train(mode)
-        self.ActionModel.train(mode)
-        if self._pcont:
-            self.DiscountModel.train(mode)
+        for model in self.world_list:
+            model.train(mode)
 
     def _preprocess(self, obs):
         obs = (obs.float() / 255.0) - 0.5
@@ -80,20 +77,20 @@ class RSSMWorldModel():
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         for e in range(1, num_epochs+1):
             self._torch_train(True)
-            for obs, actions, rewards, _, _, _, terms in tqdm(train_loader, desc=f'Epoch #{e}/{num_epochs}'):
-                metrics = self.train_batch(obs, actions, rewards, terms)
+            for obs, actions, rewards, terms, langs in tqdm(train_loader, desc=f'Epoch #{e}/{num_epochs}'):
+                metrics = self.train_batch(obs, actions, rewards, terms, langs)
                 for k, v in metrics.items():
                     logger.logkv_mean(k, v)
 
-            if e % 2 == 0:
+            if e % 10 == 0:
                 self._torch_train(False)
                 valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, shuffle=True)
-                for obs, actions, rewards, _, _, _, terms in valid_loader:
-                    metrics = self.eval_batch(obs, actions, rewards, terms)
+                for obs, actions, rewards, terms, langs in valid_loader:
+                    metrics = self.eval_batch(obs, actions, rewards, terms, langs)
                     for k, v in metrics.items():
                         logger.logkv_mean(k, v)
-                obs, actions, rewards, _, _, _, terms = valid_dataset.dataset.sample_batch(batch_size)
-                self.visualize(obs, actions, rewards, terms, rollout_length=50, save_dir=logger.result_dir)
+                obs, actions, rewards, terms, langs = valid_dataset.dataset.sample_batch(batch_size)
+                self.visualize(obs, actions, rewards, terms, langs, rollout_length=20, save_dir=logger.result_dir)
                 self.save_model(e, logger.checkpoint_dir)
 
             logger.set_timestep(e)
@@ -101,14 +98,16 @@ class RSSMWorldModel():
 
         self.save_model(e, logger.model_dir)
     
-    def train_batch(self, obs, actions, rewards, terms):
+    def train_batch(self, obs, actions, rewards, terms, langs):
         """ 
         trains the world model
         """
         train_metrics = {}
         obs = self._preprocess(obs)
+        seq_len = rewards.shape[1]
         rewards = rewards.unsqueeze(-1) # (batch, t_len, 1)
         nonterms = (1-terms.float()).unsqueeze(-1) # (batch, t_len, 1)
+        lang_embeds = self.LangModel(list(langs))
 
         embed = self.ObsEncoder(obs)                                         #t to t+seq_len
         prev_rssm_state = self.RSSM._init_rssm_state(obs.shape[0])   
@@ -116,7 +115,7 @@ class RSSMWorldModel():
         post_modelstate = self.RSSM.get_model_state(posterior)               #t to t+seq_len
         obs_dist = self.ObsDecoder(post_modelstate[:, :-1])                     #t to t+seq_len-1  
         reward_dist = self.RewardModel(post_modelstate[:, :-1])               #t to t+seq_len-1
-        action_dist = self.ActionModel(post_modelstate[:, :-1])                #t to t+seq_len-1
+        action_dist = self.ActionModel(torch.cat([post_modelstate[:, :-1].clone().detach(), lang_embeds.unsqueeze(1).repeat(1, seq_len-1, 1)], dim=-1))                #t to t+seq_len-1
 
         if self._pcont:
             pcont_dist = self.DiscountModel(post_modelstate[:, :-1])                #t to t+seq_len-1
@@ -124,7 +123,8 @@ class RSSMWorldModel():
         
         obs_loss = self._obs_loss(obs_dist, obs[:, :-1])
         reward_loss = self._reward_loss(reward_dist, rewards[:, 1:])
-        action_loss = self._action_loss(action_dist, actions[:, 1:])
+        action_masks = np.array([lang!="do nothing" for lang in langs])
+        action_loss = self._action_loss(action_dist, actions[:, 1:], action_masks)
         prior_dist, post_dist, div = self._kl_loss(prior, posterior)
 
         model_loss = self._loss_scale['kl']*div + self._loss_scale['reward']*reward_loss \
@@ -148,6 +148,7 @@ class RSSMWorldModel():
         train_metrics['train/action_loss'] = action_loss.item()
         train_metrics['train/prior_entropy'] = prior_ent.item()
         train_metrics['train/posterior_entropy'] = post_ent.item()
+        train_metrics['max_action'] = action_dist.max().item()
         if self._pcont:
             train_metrics['train/pcont_loss'] = pcont_loss.item()
 
@@ -192,19 +193,22 @@ class RSSMWorldModel():
         pcont_loss = -torch.mean(pcont_dist.log_prob(pcont_target))
         return pcont_loss
     
-    def _action_loss(self, action_dist, actions, mode='log_prob'):
-        if mode == 'log_prob':
-            action_loss = -torch.mean(action_dist.log_prob(actions))
-        else:
-            action_loss = ((action_dist.mode()[0] - actions) ** 2).mean()
-        return action_loss
+    def _action_loss(self, action_dist, actions, action_masks, mode='log_prob'):
+        # if mode == 'log_prob':
+        #     action_loss = -torch.mean(action_dist.log_prob(actions)[action_masks])
+        # else:
+        #     action_loss = ((action_dist.mode()[0] - actions) ** 2)[action_masks].mean()
+        action_loss = ((action_dist - actions) ** 2)[action_masks]
+        return action_loss.mean()
     
     @torch.no_grad()
-    def eval_batch(self, obs, actions, rewards, terms):
+    def eval_batch(self, obs, actions, rewards, terms, langs):
         eval_metrics = {}
         obs = self._preprocess(obs)
+        seq_len = rewards.shape[1]
         rewards = rewards.unsqueeze(-1) # (batch, t_len, 1)
         nonterms = (1-terms.float()).unsqueeze(-1) # (batch, t_len, 1)
+        lang_embeds = self.LangModel(list(langs))
 
         embed = self.ObsEncoder(obs)                                         #t to t+seq_len
         prev_rssm_state = self.RSSM._init_rssm_state(obs.shape[0])   
@@ -212,7 +216,7 @@ class RSSMWorldModel():
         post_modelstate = self.RSSM.get_model_state(posterior)               #t to t+seq_len
         obs_dist = self.ObsDecoder(post_modelstate[:, :-1])                     #t to t+seq_len-1  
         reward_dist = self.RewardModel(post_modelstate[:, :-1])               #t to t+seq_len-1
-        action_dist = self.ActionModel(post_modelstate[:, :-1])                #t to t+seq_len-1
+        action_dist = self.ActionModel(torch.cat([post_modelstate[:, :-1], lang_embeds.unsqueeze(1).repeat(1, seq_len-1, 1)], dim=-1))                #t to t+seq_len-1
 
         if self._pcont:
             pcont_dist = self.DiscountModel(post_modelstate[:, :-1])                #t to t+seq_len-1
@@ -220,7 +224,8 @@ class RSSMWorldModel():
         
         obs_loss = self._obs_loss(obs_dist, obs[:, :-1], mode='mse')
         reward_loss = self._reward_loss(reward_dist, rewards[:, 1:], mode='mse')
-        action_loss = self._action_loss(action_dist, actions[:, 1:], mode='mse')
+        action_masks = np.array([lang!="do nothing" for lang in langs])
+        action_loss = self._action_loss(action_dist, actions[:, 1:], action_masks, mode='mse')
 
         eval_metrics['eval/obs_mse'] = obs_loss.item()
         eval_metrics['eval/reward_mse'] = reward_loss.item()
@@ -229,24 +234,27 @@ class RSSMWorldModel():
         return eval_metrics
     
     @torch.no_grad()
-    def visualize(self, obs, actions, rewards, terms, rollout_length, save_dir):
+    def visualize(self, obs, actions, rewards, terms, langs, rollout_length, save_dir):
         obs = self._preprocess(obs)
         b, seq_len, c, h, w = obs.shape
         nonterms = (1-terms.float()).unsqueeze(-1) # (batch, t_len, 1)
+        lang_embeds = self.LangModel(list(langs))
         obs_embed = self.ObsEncoder(obs)
         prev_rssm_state = self.RSSM._init_rssm_state(b)
         _, rssm_state = self.RSSM.rssm_observe(obs_embed[:, 0], actions[:, 0], nonterms[:, 0], prev_rssm_state)
         modelstate = self.RSSM.get_model_state(rssm_state)
-        action_dist = self.ActionModel(modelstate)
-        action = action_dist.mode()[0]
+        action_dist = self.ActionModel(torch.cat([modelstate, lang_embeds], dim=-1))
+        # action = action_dist.mode()[0]
+        action = action_dist
         obs_preds = [obs[:,0].cpu().numpy()]
         for i in range(1, rollout_length):
             rssm_state = self.RSSM.rssm_imagine(action, rssm_state, nonterms[:, i])
             modelstate = self.RSSM.get_model_state(rssm_state)
             obs_dist = self.ObsDecoder(modelstate)
-            obs_preds.append(obs_dist.mode.cpu().numpy())
-            action_dist = self.ActionModel(modelstate)
-            action = action_dist.mode()[0]
+            obs_preds.append(obs_dist.mean.cpu().numpy())
+            action_dist = self.ActionModel(torch.cat([modelstate, lang_embeds], dim=-1))
+            # action = action_dist.mode()[0]
+            action = action_dist
         obs_preds = np.concatenate(obs_preds, axis=-1) # (batch, c, h, w*seq_len)
         obs_preds = np.transpose(obs_preds, (0, 2, 3, 1)) # (batch, h, w*seq_len, c)
         obs_preds = ((obs_preds + 0.5)*255.0).clip(0, 255).astype(np.uint8)

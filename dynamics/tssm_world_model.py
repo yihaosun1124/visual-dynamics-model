@@ -31,6 +31,7 @@ class TSSMWorldModel():
             RewardModel,
             DiscountModel,
             ActionModel,
+            LangModel,
             model_optimizer,
             seq_len,
             kl_info,
@@ -46,7 +47,8 @@ class TSSMWorldModel():
         self.ObsDecoder = ObsDecoder
         self.RewardModel = RewardModel
         self.ActionModel = ActionModel
-        self.world_list = [TSSM, self.ObsEncoder, self.ObsDecoder, self.RewardModel, self.ActionModel]
+        self.LangModel = LangModel
+        self.world_list = [self.TSSM, self.ObsEncoder, self.ObsDecoder, self.RewardModel, self.ActionModel]
         if DiscountModel is not None:
             self.DiscountModel = DiscountModel
             self.world_list.append(self.DiscountModel)
@@ -61,13 +63,8 @@ class TSSMWorldModel():
         self._grad_clip_norm = grad_clip_norm
 
     def _torch_train(self, mode=True):
-        self.TSSM.train(mode)
-        self.ObsEncoder.train(mode)
-        self.ObsDecoder.train(mode)
-        self.RewardModel.train(mode)
-        self.ActionModel.train(mode)
-        if self._pcont:
-            self.DiscountModel.train(mode)
+        for model in self.world_list:
+            model.train(mode)
 
     def _preprocess(self, obs):
         obs = (obs.float() / 255.0) - 0.5
@@ -80,20 +77,20 @@ class TSSMWorldModel():
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         for e in range(1, num_epochs+1):
             self._torch_train(True)
-            for obs, actions, rewards, _, _, _, terms in tqdm(train_loader, desc=f'Epoch #{e}/{num_epochs}'):
-                metrics = self.train_batch(obs, actions, rewards, terms)
+            for obs, actions, rewards, terms, langs in tqdm(train_loader, desc=f'Epoch #{e}/{num_epochs}'):
+                metrics = self.train_batch(obs, actions, rewards, terms, langs)
                 for k, v in metrics.items():
                     logger.logkv_mean(k, v)
 
             if e % 2 == 0:
                 self._torch_train(False)
                 valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, shuffle=True)
-                for obs, actions, rewards, _, _, _, terms in valid_loader:
-                    metrics = self.eval_batch(obs, actions, rewards, terms)
+                for obs, actions, rewards, terms, langs in valid_loader:
+                    metrics = self.eval_batch(obs, actions, rewards, terms, langs)
                     for k, v in metrics.items():
                         logger.logkv_mean(k, v)
-                obs, actions, rewards, _, _, _, terms = valid_dataset.dataset.sample_batch(batch_size)
-                self.visualize(obs, actions, rewards, terms, rollout_length=50, save_dir=logger.result_dir)
+                obs, actions, rewards, terms, langs = valid_dataset.dataset.sample_batch(batch_size)
+                self.visualize(obs, actions, rewards, terms, langs, rollout_length=20, save_dir=logger.result_dir)
                 self.save_model(e, logger.checkpoint_dir)
 
             logger.set_timestep(e)
@@ -101,21 +98,23 @@ class TSSMWorldModel():
 
         self.save_model(e, logger.model_dir)
     
-    def train_batch(self, obs, actions, rewards, terms):
+    def train_batch(self, obs, actions, rewards, terms, langs):
         """ 
         trains the world model
         """
         train_metrics = {}
         obs = self._preprocess(obs)
+        seq_len = rewards.shape[1]
         rewards = rewards.unsqueeze(-1) # (batch, t_len, 1)
         nonterms = (1-terms.float()).unsqueeze(-1) # (batch, t_len, 1)
+        lang_embeds = self.LangModel(langs)
 
         embeds = self.ObsEncoder(obs)                                         #t to t+seq_len 
         prior, posterior = self.TSSM.tssm_observe(embeds, actions)
         post_modelstate = self.TSSM.get_model_state(posterior)               #t to t+seq_len
         obs_dist = self.ObsDecoder(post_modelstate[:, :-1])                     #t to t+seq_len-1  
         reward_dist = self.RewardModel(post_modelstate[:, :-1])               #t to t+seq_len-1
-        action_dist = self.ActionModel(post_modelstate[:, :-1])                #t to t+seq_len-1
+        action_dist = self.ActionModel(torch.cat([post_modelstate[:, :-1], lang_embeds.unsqueeze(1).repeat(1, seq_len-1, 1)], dim=-1))                #t to t+seq_len-1
 
         if self._pcont:
             pcont_dist = self.DiscountModel(post_modelstate[:, :-1])                #t to t+seq_len-1
@@ -199,18 +198,20 @@ class TSSMWorldModel():
         return action_loss
     
     @torch.no_grad()
-    def eval_batch(self, obs, actions, rewards, terms):
+    def eval_batch(self, obs, actions, rewards, terms, langs):
         eval_metrics = {}
         obs = self._preprocess(obs)
+        seq_len = rewards.shape[1]
         rewards = rewards.unsqueeze(-1) # (batch, t_len, 1)
         nonterms = (1-terms.float()).unsqueeze(-1) # (batch, t_len, 1)
+        lang_embeds = self.LangModel(langs)
 
         embeds = self.ObsEncoder(obs)                                         #t to t+seq_len  
         prior, posterior = self.TSSM.tssm_observe(embeds, actions)
         post_modelstate = self.TSSM.get_model_state(posterior)               #t to t+seq_len
         obs_dist = self.ObsDecoder(post_modelstate[:, :-1])                     #t to t+seq_len-1  
         reward_dist = self.RewardModel(post_modelstate[:, :-1])               #t to t+seq_len-1
-        action_dist = self.ActionModel(post_modelstate[:, :-1])                #t to t+seq_len-1
+        action_dist = self.ActionModel(torch.cat([post_modelstate[:, :-1], lang_embeds.unsqueeze(1).repeat(1, seq_len-1, 1)], dim=-1))                #t to t+seq_len-1
 
         if self._pcont:
             pcont_dist = self.DiscountModel(post_modelstate[:, :-1])                #t to t+seq_len-1
@@ -227,13 +228,14 @@ class TSSMWorldModel():
         return eval_metrics
     
     @torch.no_grad()
-    def visualize(self, obs, actions, rewards, terms, rollout_length, save_dir):
+    def visualize(self, obs, actions, rewards, terms, langs, rollout_length, save_dir):
         obs = self._preprocess(obs)
         b, seq_len, c, h, w = obs.shape
         obs_embed = self.ObsEncoder(obs)
+        lang_embeds = self.LangModel(langs)
         _, tssm_state = self.TSSM.tssm_observe(obs_embed[:, :1], actions[:, :1]) # (batch, 1, dim)
         modelstate = self.TSSM.get_model_state(tssm_state)
-        action_dist = self.ActionModel(modelstate)
+        action_dist = self.ActionModel(modelstate, lang_embeds)
         action = action_dist.mode()[0] # (batch, 1, act_dim)
 
         prev_tssm_stochs = torch.cat([torch.zeros_like(tssm_state.stoch).repeat(1, rollout_length-1, 1), tssm_state.stoch], 1)
@@ -252,8 +254,8 @@ class TSSMWorldModel():
             )
             modelstate = self.TSSM.get_model_state(tssm_state)[:, -1]
             obs_dist = self.ObsDecoder(modelstate)
-            obs_preds.append(obs_dist.mode.cpu().numpy())
-            action_dist = self.ActionModel(modelstate)
+            obs_preds.append(obs_dist.mean.cpu().numpy())
+            action_dist = self.ActionModel(modelstate, lang_embeds)
             action = action_dist.mode()[0]
 
             prev_tssm_stochs = torch.cat([prev_tssm_stochs, tssm_state.stoch[:, -1:]], 1)

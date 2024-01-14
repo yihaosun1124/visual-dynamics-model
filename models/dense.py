@@ -45,6 +45,7 @@ class DenseModel(nn.Module):
             layers,
             node_size,
             activation,
+            dropout,
             dist,
         ):
         """
@@ -58,6 +59,7 @@ class DenseModel(nn.Module):
         self._layers = layers
         self._node_size = node_size
         self.activation = ACTIVATIONS[activation]
+        self.dropout = dropout
         self.dist = dist
         self.model = self.build_model()
 
@@ -67,6 +69,7 @@ class DenseModel(nn.Module):
         for i in range(self._layers-1):
             model += [nn.Linear(self._node_size, self._node_size)]
             model += [self.activation()]
+            if self.dropout: model += [nn.Dropout(self.dropout)]
         model += [nn.Linear(self._node_size, int(np.prod(self._output_shape)))]
         return nn.Sequential(*model)
 
@@ -89,6 +92,7 @@ class Actor(DenseModel):
             layers,
             node_size,
             activation,
+            dropout,
             max_mu=1.0,
             sigma_min=-5.0,
             sigma_max=2.0
@@ -99,6 +103,7 @@ class Actor(DenseModel):
             layers,
             node_size,
             activation,
+            dropout,
             None,
         )
 
@@ -112,8 +117,9 @@ class Actor(DenseModel):
         logits = self.model(input)
         mu = self.mu(logits)
         mu = self._max * torch.tanh(mu)
-        sigma = torch.clamp(self.sigma(logits), min=self._sigma_min, max=self._sigma_max).exp()
-        return TanhNormalWrapper(mu, sigma)
+        # sigma = torch.clamp(self.sigma(logits), min=self._sigma_min, max=self._sigma_max).exp()
+        # return TanhNormalWrapper(mu, sigma)
+        return mu
 
 
 class EnsembleLinear(nn.Module):

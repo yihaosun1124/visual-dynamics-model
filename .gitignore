@@ -8,3 +8,4 @@
 **/*.txt
 **/.vscode
 **/_log
+**/generated_data
